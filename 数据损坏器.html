@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数据损坏器</title>
+<style>
+  :root{ --bg:#0a0c10; --panel:#12161d; --line:#232a36; --txt:#c9d1d9; --dim:#7a8598; --red:#ff4d5e; --green:#3fb950; }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--txt);
+    font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;
+    display:flex;flex-direction:column;align-items:center;padding:20px;
+  }
+  h1{font-size:14px;letter-spacing:.15em;color:var(--red);margin:0 0 18px}
+  .panel{
+    width:100%;max-width:800px;background:var(--panel);
+    border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:14px;
+  }
+  .row{display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+  .row:last-child{margin-bottom:0}
+  .row label{font-size:11px;color:var(--dim);min-width:80px}
+  input[type=file]{color:var(--txt);font-size:12px}
+  input[type=range]{flex:1;accent-color:var(--red);min-width:160px}
+  .val{font-size:11px;color:var(--green);min-width:44px;text-align:right}
+  select{
+    background:#0a0c10;color:var(--txt);border:1px solid var(--line);
+    padding:5px 8px;font:inherit;font-size:12px;border-radius:4px;
+  }
+  button{
+    background:#1c212b;color:var(--txt);border:1px solid var(--line);
+    padding:8px 14px;font:inherit;font-size:12px;cursor:pointer;border-radius:4px;
+    transition:.15s;letter-spacing:.04em;
+  }
+  button:hover{background:#252b38;border-color:#38424f}
+  button:active{transform:translateY(1px)}
+  button.primary{background:var(--red);border-color:var(--red);color:#fff;font-weight:600}
+  button.primary:hover{background:#ff6675}
+  button:disabled{opacity:.3;cursor:not-allowed}
+  video{
+    width:100%;max-width:800px;background:#000;border-radius:8px;
+    border:1px solid var(--line);display:block;
+  }
+  .status{
+    font-size:11px;color:var(--dim);margin-top:12px;text-align:center;
+    max-width:800px;line-height:1.7;
+  }
+  .status b{color:var(--green)}
+  .status .warn{color:#e3b341}
+  .status .err{color:var(--red)}
+  .boxlist{
+    font-size:10px;color:var(--dim);max-height:90px;overflow:auto;
+    background:#0a0c10;border:1px solid var(--line);border-radius:4px;
+    padding:8px;margin-top:8px;white-space:pre;
+  }
+</style>
+</head>
+<body>
+
+<h1>数据损坏器</h1>
+
+<div class="panel">
+  <div class="row">
+    <label>视频文件</label>
+    <input type="file" id="file" accept="video/mp4,video/*">
+  </div>
+  <div class="row">
+    <label>失真程度</label>
+    <input type="range" id="strength" min="1" max="100" value="12">
+    <span class="val" id="strengthVal">12%</span>
+  </div>
+  <div class="row">
+    <label>损坏方式</label>
+    <select id="mode">
+      <option value="flip">比特翻转</option>
+      <option value="zero">字节抹零</option>
+      <option value="swap">块交换</option>
+      <option value="mixed" selected>混合模式</option>
+    </select>
+  </div>
+  <div class="row">
+    <button class="primary" id="btnCorrupt" disabled>损坏并播放</button>
+    <button id="btnDownload" disabled>下载损坏文件</button>
+    <button id="btnReset" disabled>恢复原视频</button>
+  </div>
+</div>
+
+<video id="player" controls playsinline></video>
+
+<div class="status" id="status">等待载入视频…</div>
+<div class="boxlist" id="boxlist"></div>
+
+<script>
+(() => {
+'use strict';
+
+const fileInput  = document.getElementById('file');
+const player     = document.getElementById('player');
+const btnCorrupt = document.getElementById('btnCorrupt');
+const btnDown    = document.getElementById('btnDownload');
+const btnReset   = document.getElementById('btnReset');
+const slStrength = document.getElementById('strength');
+const lblStrength= document.getElementById('strengthVal');
+const modeSel    = document.getElementById('mode');
+const statusEl   = document.getElementById('status');
+const boxlistEl  = document.getElementById('boxlist');
+
+let originalBuffer = null;
+let originalName   = '';
+let originalUrl    = null;
+let corruptedUrl   = null;
+
+slStrength.addEventListener('input', () => lblStrength.textContent = slStrength.value + '%');
+
+function readUint32(dv, off) { return dv.getUint32(off, false); }
+function readUint64(dv, off) {
+  const hi = dv.getUint32(off, false);
+  const lo = dv.getUint32(off + 4, false);
+  return hi * 0x100000000 + lo;
+}
+function boxType(view, off) {
+  return String.fromCharCode(view[off], view[off+1], view[off+2], view[off+3]);
+}
+
+function parseTopLevelBoxes(buffer) {
+  const view = new Uint8Array(buffer);
+  const dv   = new DataView(buffer);
+  const len  = buffer.byteLength;
+  const boxes = [];
+  let pos = 0;
+  let guard = 0;
+
+  while (pos < len - 8 && guard++ < 64) {
+    let size = readUint32(dv, pos);
+    const type = boxType(view, pos + 4);
+
+    if (size === 1) {
+      if (pos + 16 > len) break;
+      size = readUint64(dv, pos + 8);
+    }
+
+    if (size < 8 || pos + size > len) break;
+
+    boxes.push({ type, start: pos, end: pos + size, size });
+    pos += size;
+  }
+
+  return boxes;
+}
+
+function damageRange(view, start, end, strength, mode) {
+  const len = end - start;
+  if (len <= 8) return 0;
+
+  const baseInterval = Math.max(128, Math.floor(8000 / Math.max(1, strength)));
+
+  let cursor = start;
+  let hits = 0;
+
+  while (cursor < end) {
+    const jitter = Math.floor(Math.random() * baseInterval);
+    const pos = cursor + jitter;
+    if (pos >= end - 4) break;
+
+    if (mode === 'flip') {
+      const n = 1 + (Math.random() < 0.3 ? 1 : 0);
+      for (let i = 0; i < n; i++) {
+        const bit = 1 << (Math.random() * 8 | 0);
+        view[pos + i] ^= bit;
+      }
+      hits++;
+    } else if (mode === 'zero') {
+      const n = 1 + (Math.random() * 3 | 0);
+      for (let i = 0; i < n && pos + i < end; i++) view[pos + i] = 0;
+      hits++;
+    } else if (mode === 'swap') {
+      const other = start + Math.floor(Math.random() * (len - 8));
+      const blk = 1 + (Math.random() * 4 | 0);
+      for (let i = 0; i < blk; i++) {
+        const a = pos + i;
+        const b = other + i;
+        if (a >= end || b >= end) break;
+        const t = view[a]; view[a] = view[b]; view[b] = t;
+      }
+      hits++;
+    } else {
+      const r = Math.random();
+      if (r < 0.4) {
+        const n = 1 + (Math.random() * 2 | 0);
+        for (let i = 0; i < n && pos + i < end; i++) view[pos + i] ^= 1 << (Math.random() * 8 | 0);
+      } else if (r < 0.7) {
+        const n = 1 + (Math.random() * 3 | 0);
+        for (let i = 0; i < n && pos + i < end; i++) view[pos + i] = 0;
+      } else {
+        const n = 1 + (Math.random() * 3 | 0);
+        for (let i = 0; i < n && pos + i < end; i++) view[pos + i] = Math.random() * 256 | 0;
+      }
+      hits++;
+    }
+
+    cursor = pos + baseInterval;
+  }
+
+  return hits;
+}
+
+function corruptBuffer(buffer, strength, mode) {
+  const copy = buffer.slice(0);
+  const view = new Uint8Array(copy);
+  const boxes = parseTopLevelBoxes(copy);
+
+  boxlistEl.textContent = boxes
+    .map(b => `${b.type.padEnd(4)}  ${String(b.size).padStart(10)}  @${b.start}`)
+    .join('\n');
+
+  const mdat = boxes.find(b => b.type === 'mdat');
+  if (!mdat) {
+    const start = Math.min(4096, copy.byteLength);
+    const hits = damageRange(view, start, copy.byteLength, strength, mode);
+    return { buffer: copy, hits, note: '未找到 mdat，已对文件主体损坏' };
+  }
+
+  const dataStart = mdat.start + 8;
+  const dataEnd   = mdat.end;
+  const dataLen   = dataEnd - dataStart;
+
+  if (dataLen < 128) {
+    return { buffer: copy, hits: 0, note: 'mdat 太小，未损坏' };
+  }
+
+  const protectBytes = 1024;
+  const workStart = dataStart + Math.min(protectBytes, Math.floor(dataLen * 0.05));
+  const workEnd   = dataEnd;
+
+  if (workEnd - workStart < 32) {
+    return { buffer: copy, hits: 0, note: '无足够可损坏区域' };
+  }
+
+  const hits = damageRange(view, workStart, workEnd, strength, mode);
+  return {
+    buffer: copy,
+    hits,
+    note: `mdat ${dataStart}~${dataEnd}，已损坏 ${hits} 处`
+  };
+}
+
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  originalName = file.name;
+  statusEl.innerHTML = '正在读取文件…';
+
+  try {
+    originalBuffer = await file.arrayBuffer();
+  } catch (err) {
+    statusEl.innerHTML = '<span class="err">读取失败：' + err.message + '</span>';
+    return;
+  }
+
+  if (originalUrl)  URL.revokeObjectURL(originalUrl);
+  if (corruptedUrl) URL.revokeObjectURL(corruptedUrl);
+  originalUrl = URL.createObjectURL(file);
+
+  player.src = originalUrl;
+  player.load();
+
+  btnCorrupt.disabled = false;
+  btnReset.disabled   = false;
+  btnDown.disabled    = true;
+
+  statusEl.innerHTML = `已载入 <b>${file.name}</b> · ${(file.size/1048576).toFixed(2)} MB 原始视频可正常播放`;
+});
+
+btnCorrupt.addEventListener('click', () => {
+  if (!originalBuffer) return;
+
+  const strength = parseInt(slStrength.value, 10);
+  const mode     = modeSel.value;
+
+  statusEl.innerHTML = '正在损坏数据…';
+
+  setTimeout(() => {
+    let result;
+    try {
+      result = corruptBuffer(originalBuffer, strength, mode);
+    } catch (err) {
+      statusEl.innerHTML = '<span class="err">损坏失败：' + err.message + '</span>';
+      return;
+    }
+
+    const blob = new Blob([result.buffer], { type: 'video/mp4' });
+    if (corruptedUrl) URL.revokeObjectURL(corruptedUrl);
+    corruptedUrl = URL.createObjectURL(blob);
+
+    player.src = corruptedUrl;
+    player.load();
+    player.play().catch(() => {});
+
+    btnDown.disabled = false;
+
+    statusEl.innerHTML =
+      `损坏完成 · 修改 <b>${result.hits}</b> 处 · 失真程度 ${strength}%<br>` +
+      `<span class="warn">${result.note}</span>`;
+  }, 30);
+});
+
+btnDown.addEventListener('click', () => {
+  if (!corruptedUrl) return;
+  const a = document.createElement('a');
+  a.href = corruptedUrl;
+  const base = originalName.replace(/\.[^.]+$/, '');
+  a.download = base + '_corrupted.mp4';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+
+btnReset.addEventListener('click', () => {
+  if (!originalUrl) return;
+  player.src = originalUrl;
+  player.load();
+  player.play().catch(() => {});
+  statusEl.innerHTML = '已恢复原始视频';
+});
+
+})();
+</script>
+</body>
+</html>
